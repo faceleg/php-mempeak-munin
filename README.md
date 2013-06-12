@@ -1,12 +1,11 @@
-php-mempeak-munin
-=================
-
 Clone of https://code.google.com/p/php-mempeak/
 
 # Usage
 
     ./php_mempeak_munin setup
-    
+
+# About
+
 Ostensibly a munin plugin, php_mempeak is turning into a stand-alone application.
 
 On exit, php scripts check if their memory usage (see memory_get_peak_usage) was above a given threshold, and dump a brief log if so. php_mempeak runs as a cron job (called by munin) and stores the log with the highest byte count since the last run in a round robin database. Munin shows us this data as a pretty graph.
