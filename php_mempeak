@@ -1,0 +1,621 @@
+#!/usr/bin/php
+<?php
+/*
+    Todo: check dependencies (php5-sqlite). Script touches db but  failes to install tables, and continues to fail since 
+    db "exists" so if statement checks db setup.
+    
+    /etc/php5/cli/conf.d/mcrypt.ini ini comment problem as per ever - kills script for munin? maybe not
+*/
+####    PROCEDURE
+
+/*
+    This script needs to be run as root 
+*/
+
+    if(exec('whoami') != 'root'){
+        echo "You need to run this as root. Exiting.\n";
+        exit(1);
+    }
+
+/*
+    $argv[1] holds our main command 
+*/
+    $to_do = isset($argv[1]) ? $argv[1] : '';
+    
+/* 
+    We need to determine whether this script was called via symlink in munin's plugins dir, or directly
+*/
+    $munin = (basename($_SERVER["SCRIPT_FILENAME"]) == 'php_mempeak_munin');
+    
+/*
+    no args from munin means run cron
+    no args from user means we need to give them usage instructions
+*/
+    if(!$to_do) $to_do = $munin ? 'cron' : 'usage';
+    
+    $do = "do_$to_do";
+    
+    if(!is_callable(array('php_mempeak', $do))){
+        echo "Argument not recognised: $to_do\n";
+        $do = 'do_usage';
+    }
+    
+    php_mempeak::$do();
+
+
+####    PHP_MEMPEAK
+    
+    class php_mempeak{
+    
+        const tmp_dir = "/tmp/munin/php_mempeak";
+        
+        const var_dir = "/var/cache/munin/php_mempeak";
+
+        
+####    BASE METHODS
+        
+        /* 
+        func: get_queued_data_files
+            
+            retrieves files in /tmp written to by exiting php scripts
+            
+            returns array file paths    
+        */
+        
+        private static function get_queued_data_files () {
+            $dir = self::tmp_dir;
+            return is_dir($dir) ? glob("$dir/*") : array();         
+        }
+        
+        /*
+        func: read_line
+        
+            reads a line from a tmp file and returns an associative array
+        */
+        
+        private static function read_line($line){
+            list($a['bytes'], $a['time'], $a['memory_limit'], $a['remote_addr'], 
+                $a['script_filename'], $a['server_name'], $a['uri'], $a['post_data']) = explode("\t", $line);
+            return $a;
+        }
+        
+        /*
+        func: bytesize
+            
+            reads an integer and returns it as a base 1024 string
+            
+            params:
+                n - integer to convert
+                d - integer decimal pints to print out, or false to default to php's precision
+        */
+        
+        private static function bytesize($n, $d=false){
+            $u = array('B', 'KiB', 'MiB', 'GiB', 'TB', 'PB', 'EB', 'ZB', 'YB');
+            for($i=0; $n >= 1024; $i++) $n = $n/1024;
+            if($i && is_integer($d)) $n = sprintf('%01.'.$d.'f', $n);
+            return "$n {$u[$i]}";
+        }
+
+        /*
+        func: message
+        
+            sets / retrieves messages meant for munin
+            
+            params:
+                set - string to set message to
+        */
+        
+        private static function message($set=null){
+            static $message;
+            if($set != null) $message = $set;
+            return $message;
+        }
+
+    
+####    DATABASE
+                
+        /*
+        func: get_db
+        
+            opens / retrieves sqlite database handle
+            
+            params:
+                 close - bool close database
+        */
+        private static function get_db($close=false){
+            static $db;
+            if(!$db){
+                if($close) return;
+                $dir = self::var_dir;
+                if(!is_dir($dir)){
+                    self::message("No dir at $dir - Run php_mempeak setup");
+                    return false;               
+                }
+                $file = "$dir/arch.db";
+                if(!$db = new SQLite3("$dir/arch.db")){
+                    self::message("Unable to write to $dir or error opening arch.db");
+                    return false;
+                }
+                register_shutdown_function(array('php_mempeak', 'close_db'));
+            }
+            if($close) $db->close();
+            return $db;
+        }
+        
+        /*
+        func: close_db
+        
+            closes sqlite db
+        */
+        
+        public static function close_db(){
+            self::get_db(1);
+        }
+        
+
+        /*
+        func: query_db
+        
+            executes a query and returns a result
+            
+            params:
+                query - string query to perform
+        */
+        
+        private static function query_db($query){
+            if(!$db = self::get_db()) return false;
+            $result = $db->query($query);
+            return $result;
+        }
+
+
+####    CONFIG, THRESHOLD, DOMAINS, PEAKS
+        
+        /*
+        func: get_config
+        
+            retrieves config from database
+        */
+        
+        private static function get_config(){
+            static $config = array();
+            if(!$config){
+                if(!$result = self::query_db('SELECT * FROM config;')) return array();
+                while($row = $result->fetchArray(SQLITE3_ASSOC)){
+                    $config[$row['key']] = $row['value'];
+                }
+            }
+            return $config;
+        }
+        
+        /*
+        func: update_config
+            
+            updates config in database
+            
+            params:
+                a - associative array of config vars
+        */
+        
+        private static function update_config($a){
+            foreach($a as $k=>$v) self::query_db("REPLACE INTO config (key, value) VALUES ('$k', '$v');");
+        }
+        
+        /*
+        func: get_threshold
+        
+            returns setup bytes threshold scripts must exceed in order to log their stats
+            
+        */
+        
+        private static function get_threshold(){
+            $config = self::get_config();
+            return isset($config['threshold']) ? (int) $config['threshold'] : 0;
+        }
+        
+        /*
+        func: get_domains
+        
+            returns associative array of domains by id
+            
+            config stores domains as domain_name => domain_id, and this function inverts it to 
+            domain_id => array(domain names)
+            
+        */
+        
+        private static function get_domains(){
+            $config = self::get_config();
+            $domains = array();
+            unset($config['threshold']);
+            foreach($config as $domain_name => $domain_id){
+                $domains[$domain_id][] = $domain_name;
+            }
+            return $domains;
+        }
+        
+        /*
+        func: get_peaks
+        
+            retrieves last recorded byte values for each domain
+        */
+        
+        private static function get_peaks(){
+            static $peaks = array();
+            if(!$peaks){
+                if(!$result = self::query_db('SELECT * FROM peaks;')) return array();
+                while($row = $result->fetchArray(SQLITE3_ASSOC)){
+                    $peaks[$row['domain']] = $row['peak'];
+                }
+            }
+            return $peaks;  
+        }
+        
+        /*
+        func: update_peaks
+        
+            dumps last recorded peaks for each domain in a special table
+        
+            params:
+                a - associative array (domain_id => bytes) to update
+        */
+        
+        private static function update_peaks($a){
+            foreach($a as $k=>$v) self::query_db("REPLACE INTO peaks (domain, peak) VALUES ('$k', '$v');");
+        }
+        
+        
+####    CALLABLE METHODS
+        
+        /*
+        func: do_usage
+        
+            echoes basic instructions for user
+        */
+        
+        public static function do_usage(){
+            echo "Usage: \n";
+        }
+        
+        /*
+        func: do_autoconf
+        
+            required by munin.  tells it to look for our config in its conf.d
+            
+        */
+        
+        public static function do_autoconf(){
+            echo "no\n";
+            exit(0);
+        }
+        
+        /*
+        func: do_config
+        
+            required by munin 
+            
+        */      
+        
+        public static function do_config(){
+        
+            $threshold = self::get_threshold();
+
+            if(!$message = self::message()) $message = "On exit, scripts log their memory allocation if above "
+            . "given threshold (".self::bytesize($threshold)."). <br /> "
+            . "Call 'php_mempeak query {domain-name}' to recall detailed info about peak events over a given "
+            . "period. <br /> "
+            . "For visual clarity, graph always shows last recorded value on every draw, until figure is increased "
+            . "or decreased.";
+        
+            echo "graph_args --base 1024 --lower-limit $threshold --rigid\n";
+            echo "graph_vlabel Bytes\n";
+            echo "graph_title PHP high memory requests\n";
+            echo "graph_category php\n";
+            echo "graph_info $message\n\n";
+            
+            $domains = self::get_domains();
+            
+            // placeholder until initial data is collected
+            if(!count($domains)){
+                echo "dummy.info No data yet - have you run 'php_mempeak setup' and auto_prepended "
+                . "/usr/local/include/php_mempeak/preclude.php?\n";
+                echo "dummy.label (no data)\n";
+                echo "dummy.type GAUGE\n\n";
+                exit(0);
+            }
+            
+            // else config for each domain
+            foreach($domains as $id => $names){
+                echo "$id.label $id\n";
+                echo "$id.draw LINE1\n";
+                echo "$id.type GAUGE\n";
+                echo "$id.info ".implode(', ', $names)."\n\n";
+            }
+            
+            exit(0);            
+        }
+        
+        /*
+        func: do_cron
+            
+            required by munin, could be called directly by cron.
+            parses tmp files, stores peak values in db, and prints out data as for munin
+        
+        */
+        
+        public static function do_cron(){
+        
+            $time = time();
+            
+            // get all cached files for reading
+            $dir = self::tmp_dir;       
+            $peak_files = is_dir($dir) ? glob("$dir/*") : array();
+            
+            // init vars
+            $threshold = 0;
+            $domains = array();
+            
+            // look for highest peak since last read
+            foreach($peak_files as $file){
+            
+                // id of domain
+                $domain_id = preg_replace('/[^A-Za-z0-9_]/', '', basename($file));
+
+                $peak_bytes = 0;
+                
+                $peak_line = "";
+            
+                if($lines = file($file, FILE_IGNORE_NEW_LINES)){
+                    // unlink now
+                    unlink($file);
+                    // get bytes, first var in line
+                    foreach($lines as $line){
+                        list($b,) = explode("\t", $line, 2);
+                        if($b > $peak_bytes){
+                            $peak_bytes = $b;
+                            $peak_line = $line;
+                        }
+                    }
+                }
+                
+                // if we have data, we have the line we want
+                if($peak_line) $domains[$domain_id] = self::read_line($peak_line);  
+            }
+            
+            // clear memory
+            unset($lines);
+            
+            // cached data      
+            $domains_config = self::get_domains();
+            
+            if(count($domains)){
+            
+                $config_updates = array();
+                
+                $peak_updates = array();
+            
+                foreach($domains as $id=>$domain){
+                    $cached = isset($domains_config[$id]) ? $domains_config[$id] : array();
+                    if(in_array($domain['server_name'], $cached)) continue;
+                    $config_updates[$domain['server_name']] = $id;
+                }
+            
+                if(count($config_updates)) self::update_config($config_updates);
+            
+                foreach($domains as $id => $domain){
+                
+                    /* set the value for munin */
+                    echo "$id.value {$domain['bytes']}\n";
+                    
+                    self::query_db("INSERT INTO data 
+                        (bytes, time, memory_limit, remote_addr, 
+                        script_filename, server_name, uri, post_data)
+                         VALUES ({$domain['bytes']}, 
+                            {$domain['time']},
+                            '{$domain['memory_limit']}', 
+                            '{$domain['remote_addr']}', 
+                            '{$domain['script_filename']}', 
+                            '{$domain['server_name']}', 
+                            '{$domain['uri']}', 
+                            '{$domain['post_data']}'
+                         );");
+                
+                    /* unset from cached domains */
+                    unset($domains_config[$id]);
+                    
+                    $peak_updates[$id] = $domain['bytes'];
+                
+                }
+                
+                if(count($peak_updates)) self::update_peaks($peak_updates);
+                
+            }else{
+                if(!count($domains_config)){
+                    echo "dummy.value 0\n";
+                    exit(0);
+                }
+                
+            }
+            
+            foreach(array_keys($domains_config) as $id){
+                
+                $peaks = self::get_peaks();
+                $last_peak = isset($peaks[$id]) ? $peaks[$id] : 0;
+                
+                echo "$id.value $last_peak\n";
+                
+            }
+            
+            $a_month_ago = ($time - (86400*32));
+            
+            self::query_db("DELETE FROM data WHERE time < $a_month_ago;");
+            
+            exit(0);            
+        
+        }
+        
+
+        /*
+        func: do_setup
+        
+            runs setup, creating directories, the database, writing include and config files
+            asks user for bytes threshold to log above and updates accordingly
+        */
+        
+        public static function do_setup(){
+            
+            $threshold = (1024*1024);
+            
+            echo "> Enter threshold in MiB: ";
+            
+            if(!is_numeric($t = trim(fread(STDIN, 8)))) $t = 1;
+            $threshold = ($t * 1024 * 1024);
+    
+            echo "> Given threshold is ".self::bytesize($threshold)."\n";
+            echo "> Setting up...\n";
+                
+            $var_dir = self::var_dir;
+            @mkdir($var_dir, 0750, 1);
+            chown($var_dir, 'munin');
+            
+            $db_file = "$var_dir/arch.db";
+            if(!is_file($db_file)){
+                echo "> touching $db_file... ";
+                touch($db_file);
+                echo "done\n";
+                
+                echo "> Setting up db... ";
+                if(!$db = new SQLite3($db_file)){
+                    echo "failed!\n";
+                    exit(1);
+                }
+                $db->exec('CREATE TABLE config (key STRING PRIMARY KEY, value STRING);');
+                $db->exec('CREATE TABLE peaks (domain STRING PRIMARY KEY, peak STRING);');
+                $db->exec('CREATE TABLE data 
+                    (id INTEGER PRIMARY KEY, 
+                    bytes INTEGER, 
+                    time INTEGER,
+                     memory_limit STRING, 
+                     remote_addr STRING, 
+                     script_filename STRING, 
+                     server_name STRING, 
+                     uri STRING, 
+                     post_data STRING);'
+                );
+                $db->close();
+                echo "done.\n";
+            }else echo "> Database exists.\n";
+            
+            self::query_db("REPLACE INTO config (key, value) VALUES ('threshold', '$threshold');");
+
+$prependfile_str = <<<EOD
+<?php
+
+    define('PHP_MEMPEAK_TIME', time());
+    
+    function php_mempeak_check(){
+        if(memory_get_peak_usage(1) > $threshold) include_once dirname(__FILE__).'/queue.php';
+    }
+    
+    register_shutdown_function('php_mempeak_check');
+
+EOD;
+            
+$queuefile_str = <<<'EOD'
+<?php
+
+    function php_mempeak_queue(){
+        
+        if($id = getenv('PHP_MEMPEAK_DOMAIN_ID')) $domain_id = $id;
+        elseif($id = @constant('PHP_MEMPEAK_DOMAIN_ID')) $domain_id = $id;
+        else $domain_id = $_SERVER['SERVER_NAME'];
+        
+        $dir = "/tmp/munin/php_mempeak";
+        $file = "$dir/$domain_id";
+        
+        if(!$fh = @fopen($file, 'a')){
+            if(!@mkdir($dir, 0750, 1)){
+                trigger_error("php_mempeak failed to create or cannot access cache directory $dir", 
+                    E_USER_WARNING);
+                return;
+            }
+            if(!$fh = fopen($file, 'a')){
+                trigger_error("php_mempeak failed to open queue file $file for writing", E_USER_WARNING);
+                return;
+            }
+        }
+        
+        fwrite($fh, 
+            memory_get_peak_usage(1) . "\t" .
+            PHP_MEMPEAK_TIME . "\t" . 
+            ini_get('memory_limit') . "\t" . 
+            $_SERVER['REMOTE_ADDR'] . "\t" . 
+            $_SERVER['SCRIPT_FILENAME'] . "\t" .
+            $_SERVER['SERVER_NAME'] . "\t" .
+            $_SERVER['REQUEST_URI'] . "\t" .
+            (count($_POST) ? serialize(array_keys($_POST)) : 0) . "\n"
+        );
+
+        fclose($fh);    
+    }
+    
+    php_mempeak_queue();
+
+EOD;
+
+            $inc_dir = '/usr/local/include/php_mempeak';
+            
+            if(!is_dir($inc_dir)) mkdir($inc_dir,0755,1);
+            
+            foreach(array('prepend', 'queue') as $f){
+                $file = "$inc_dir/$f.php";
+                echo "> Writing to $file...";
+                $fh = fopen($file, 'w');
+                $var = $f.'file_str';
+                fwrite($fh, $$var);
+                fclose($fh);
+                echo " done.\n";
+            }
+            
+            
+            $a = 'x';
+            while(!in_array($a, array('y', 'n'))){
+                echo "> Do you want to configure munin? (y/n): ";
+                $a = strtolower(substr(fread(STDIN, 8), 0, 1));
+            }
+            
+            if($a == 'y'){
+                $etc = '/etc/munin/plugins';
+                $usr = '/usr/share/munin/plugins';
+                if(!is_dir($etc) || !is_dir($usr)){
+                    echo "> Munin directory structure missing!\n";
+                    echo "> Failed!\n";
+                    exit(1);
+                } 
+                echo "> Writing config file for munin... ";
+                if(!$fh = fopen('/etc/munin/plugin-conf.d/php_mempeak_munin', 'w')){
+                    echo "\n> Munin plugin-conf.d missing or failed to open file for writing!\n";
+                    echo "> Failed!\n";
+                    exit(1);                    
+                }
+                fwrite($fh, "[php_mempeak_munin]\nuser root\n\n");
+                fclose($fh);
+                echo "done.\n";
+                
+                if(!is_file("$usr/php_mempeak_munin")) 
+                    symlink(__FILE__, "$usr/php_mempeak_munin");
+                if(!is_file("$etc/php_mempeak_munin")) 
+                    symlink("$usr/php_mempeak_munin", "$etc/php_mempeak_munin");
+                echo "> Symlinks done, restarting munin...\n";
+                echo ">\t". exec('service munin-node restart')."\n";
+                echo ">...  done.\n";
+            }
+        
+            echo "> Setup succesfully.\n";
+            echo "> Make sure you edit php.ini (or .htaccess) files to:\n";
+            echo ">\n";
+            echo ">\t(php_value) auto_prepend_file /usr/local/include/php_mempeak/prepend.php\n";
+            echo ">\n";
+            echo "> so you start collecting data.\n";
+        }       
+    }
+
